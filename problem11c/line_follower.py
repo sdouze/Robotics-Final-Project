@@ -78,6 +78,7 @@ class Camera:
                 raise RuntimeError(f"calibration was made for {tuple(data['size'])}, camera gives {(w, h)}")
             self.model = kin.CameraModel(data["K"], w, h)
             self.dist = data["dist"]
+            self.model.set_undistortion(self.dist)
             print(f"Camera: {w}x{h}, calibration loaded from {C.CALIBRATION_FILE}")
         else:
             self.model = kin.CameraModel.from_fov(w, h, C.CAMERA_HFOV_DEG)
@@ -158,6 +159,22 @@ class UI:
                 return True
             time.sleep(0.03)
 
+    def wait_retry(self, text):
+        """Wait while the user arranges the sheet (live view keeps running).
+        True = try again, False = quit."""
+        print(text)
+        if not self.enabled:
+            return input("Press Enter to try again, 'q' + Enter to quit: ").strip().lower() != "q"
+        print("  -> press 'r' in an image window to try again, 'q' to quit")
+        while True:
+            try:
+                key = self.poll()
+            except UserAbort:
+                return False
+            if key in (ord("r"), ord("g"), 13, 32):
+                return True
+            time.sleep(0.03)
+
     def close(self):
         if self.enabled:
             cv2.destroyAllWindows()
@@ -199,6 +216,10 @@ class LineFollower:
         self.last_view_map = None
         self.view_log = []
         self.line_map = self.mosaic
+        self.teach_mode = False     # --teach: measure the camera error with the stylus
+        self.correction = None      # camera -> stylus correction (from --teach)
+        self.correction_file = None
+        self.paper_probed = False
 
     # -- helpers ------------------------------------------------------------
     LOOK_TOLERANCE_MM = 5.0      # the image centre must land this close to the target
@@ -287,7 +308,14 @@ class LineFollower:
             while time.perf_counter() - t0 < C.SETTLE_TIME_S:
                 self.ui.poll()
                 time.sleep(0.02)
-        frame = self.camera.read(fresh=True)
+        # the sharpest of a few fresh frames: right after a move the image can be
+        # blurred (arm still shaking, webcam autofocus hunting)
+        best, frame = -1.0, None
+        for _ in range(max(1, C.LOOK_FRAMES)):
+            f = self.camera.read(fresh=True)
+            sharp = float(cv2.Laplacian(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
+            if sharp > best:
+                best, frame = sharp, f
         q = self.robot.read_q()
         T0c = kin.camera_pose(q)
         paper, frac = vis.paper_mask(frame)
@@ -391,59 +419,123 @@ class LineFollower:
         lo, hi = self.reach_band(xy)
         if lo is None:
             return f"{what} at ({xy[0]:.0f}, {xy[1]:.0f}) mm cannot be reached in that direction at all"
+        if lo <= r <= hi:
+            return (f"{what} at ({xy[0]:.0f}, {xy[1]:.0f}) mm is {r:.0f} mm from the base, inside the reach "
+                    f"({lo}-{hi} mm in that direction) but at a spot the joint limits exclude")
         where = (f"{lo - r:.0f} mm too CLOSE to the robot" if r < lo else f"{r - hi:.0f} mm too FAR from the robot")
         return (f"{what} at ({xy[0]:.0f}, {xy[1]:.0f}) mm is {r:.0f} mm from the base - {where}. "
                 f"The stylus reaches the paper only between {lo} and {hi} mm from the base")
+
+    def plan_view(self, P):
+        """Camera pose that shows ALL table points P (N, 2) at once.
+
+        Searches the same family of poses as camera_q (optical axis in the arm
+        plane, aimed at a table point, viewing angle theta, distance d), for a
+        few arm directions and aim points around the points' centre, and keeps
+        the pose whose image shows every point farthest from the image border.
+        Among poses with enough margin (LOCK_VIEW_MARGIN_PX) a steeper view is
+        preferred (less sensitive to calibration errors).
+        Returns (q, margin in pixels) - margin < 0 means some points stay outside."""
+        if kin.CAMERA_AXIS_OFFSET is None:
+            raise kin.IKError("camera view planning needs a lens looking within the arm plane")
+        P = np.asarray(P, float)
+        P3 = np.column_stack((P, np.full(len(P), C.PAPER_Z)))
+        c = P.mean(axis=0)
+        r_c, az_c = math.hypot(*c), math.atan2(c[1], c[0])
+        W, H = self.cam.width, self.cam.height
+        best_score, best_q, best_m = -np.inf, None, -np.inf
+        for daz in (0.0, -6.0, 6.0, -12.0, 12.0):
+            az = az_c + math.radians(daz)
+            u = np.array([math.cos(az), math.sin(az)])
+            for r_t in np.arange(max(40.0, r_c - 60.0), r_c + 60.1, 10.0):
+                for th_deg in np.arange(-90.0, -29.9, 2.5):
+                    th = math.radians(th_deg)
+                    for d in np.arange(60.0, 300.1, 5.0):
+                        h = -d * math.sin(th)
+                        r_cam = r_t - d * math.cos(th)
+                        if h > C.OBSERVE_HEIGHT or h < 30.0 or r_cam < 20.0:
+                            continue
+                        try:
+                            q = kin.ik_camera((*(u * r_cam), C.PAPER_Z + h), th - kin.CAMERA_AXIS_OFFSET)
+                        except kin.IKError:
+                            continue
+                        if kin.fk_tool(q)[0][2] < C.PAPER_Z + self.STYLUS_CLEARANCE_MM:
+                            continue
+                        uv, depth = self.cam.project(kin.camera_pose(q), P3)
+                        if not (np.all(np.isfinite(uv)) and np.all(depth > 1.0)):
+                            continue
+                        m = min(uv[:, 0].min(), W - 1 - uv[:, 0].max(), uv[:, 1].min(), H - 1 - uv[:, 1].max())
+                        score = min(m, C.LOCK_VIEW_MARGIN_PX + 15.0) + 0.2 * (-th_deg)
+                        if score > best_score:
+                            best_score, best_q, best_m = score, q, m
+        return best_q, best_m
 
     def acquire_line(self):
         """Find the paper and LOCK the line from a single camera view.
 
         If the whole line and the dot are in the first view: locked, nothing
-        else is looked at. If the line runs out of the picture, the camera turns
-        towards that end (keeping the dot in view). If the end where it runs out
-        is already beyond the reach of the stylus, the line cannot be followed
-        at all -> clear stop instead of looking around."""
+        else is looked at. If the line runs out of the picture, the camera does
+        NOT just turn towards the cut end (that loses the other end): every line
+        point seen so far, plus a guessed continuation beyond each cut end, is
+        given to plan_view(), which finds an arm pose (usually farther away and
+        flatter) whose single image contains all of them. This repeats with the
+        new information until one view shows the whole line and the dot.
+        Only if no single view can hold the line are the views combined."""
         frame, T0c, paper = self.search()
         self.mosaic.add_view(frame, T0c)
         line, part = self.check_newest_view()
+        seen_pts = []
+        visited = [self.robot.read_q()]
+        tight_tried = False
         tries = 0
-        while line is None and tries < C.EXTRA_MAP_ROUNDS + 1:
+        while line is None and tries < C.LOCK_MAX_VIEWS:
             tries += 1
-            if part is not None and part["open_xy"] is not None:
-                p = np.asarray(part["open_xy"], float)
-                if not self.stylus_can_reach(p):
-                    what = ("the start dot (cut off at the edge of the camera view)" if part.get("open_is_dot")
-                            else "the line, where it runs out of the camera view,")
-                    msg = self.reach_message(p, what)
-                    if self.partial and part["path"] is not None:
-                        print(f"  {msg}.\n  --partial: locking the visible line, the longest reachable "
-                              "piece of it will be followed")
-                        line, self.line_map = part, self.last_view_map
+            if part is not None and part.get("points_xy") is not None:
+                seen_pts.append(part["points_xy"])
+                dot = part.get("dot")
+                if dot is not None and dot[2] > 0 and not part.get("open_is_dot"):
+                    # the whole DISC must be inside, not only its centre
+                    a = np.linspace(0.0, 2.0 * math.pi, 16, endpoint=False)
+                    seen_pts.append(dot[:2] + (dot[2] + 3.0) * np.column_stack((np.cos(a), np.sin(a))))
+                q, margin = None, -np.inf
+                for ext in (C.LOCK_EXTEND_MM, 0.5 * C.LOCK_EXTEND_MM, 8.0):
+                    guess = [e + dvec * s for e, dvec in part["cut_ends"] for s in np.arange(4.0, ext + 0.1, 4.0)]
+                    P = np.vstack(seen_pts + ([np.array(guess)] if guess else []))
+                    q, margin = self.plan_view(P)
+                    if q is not None and margin >= C.LOCK_VIEW_MARGIN_PX:
                         break
-                    raise vis.VisionError(msg + ". Move the sheet (or redraw the line) so that the whole "
-                                          "line lies in that ring - or test the motion with --partial.",
-                                          retry=False)
-                d = np.asarray(part["dot"][:2], float)
-                u = (p - d) / max(np.linalg.norm(p - d), 1e-6)
-                target = 0.5 * (p + d) + 30.0 * u              # the dot AND the cut-off end in view
-                print(f"  -> turning the camera towards the cut-off end, looking at "
-                      f"({target[0]:.0f}, {target[1]:.0f}) mm")
+                if q is None or margin < 0:
+                    print("  no single camera view can show the whole line")
+                    break
+                if margin < C.LOCK_VIEW_MARGIN_PX:              # only a tight fit: try it once
+                    if tight_tried:
+                        print("  no single camera view shows the whole line with enough margin")
+                        break
+                    tight_tried = True
+                if min(np.max(np.abs(np.degrees(q - v))) for v in visited) < 1.5:
+                    print("  the best view was already tried")
+                    break
+                print(f"  -> moving the camera to see the whole line at once "
+                      f"(planned: all of it at least {margin:.0f} px inside the image)")
             else:
                 target = self.paper_centroid(T0c, paper)
                 print(f"  -> no line yet, looking at the middle of the paper ({target[0]:.0f}, {target[1]:.0f}) mm")
-            try:
-                q = self.camera_q(target)
-            except kin.IKError as e:
-                print(f"  cannot look there: {e}")
-                break
+                try:
+                    q = self.camera_q(target)
+                except kin.IKError as e:
+                    print(f"  cannot look there: {e}")
+                    break
             self.robot.move_joints(q)
+            visited.append(q)
             frame, T0c, paper, _ = self.look(f"view {self.n_views + 1}")
             self.mosaic.add_view(frame, T0c)
             line, part = self.check_newest_view()
         if line is None:
-            print("  no single view shows the whole line -> combining all views (less accurate)")
-            line = vis.extract_line(self.mosaic)
-            self.line_map = self.mosaic
+            print("  no single view shows the whole line -> combining the views, each one lined up "
+                  "on the line seen in the others")
+            combined = vis.combine_aligned(self.cam, self.mosaic.frames, C.PAPER_Z)
+            line = vis.extract_line(combined)
+            self.line_map = self.mosaic = combined
             if line["path"] is None:
                 raise vis.VisionError(f"{line['why']} - even after {self.n_views} camera views. Put the "
                                       "sheet so that the whole line is about 10-19 cm in front of the robot.",
@@ -527,6 +619,21 @@ class LineFollower:
         print(f"  paper height: stopped after {len(history)} iterations at PAPER_Z = {C.PAPER_Z:.1f} mm")
 
     # -- touch the paper once to measure its height ----------------------------
+    def can_probe(self, xy, pitch, quiet=False):
+        """True if the stylus can be lowered at xy from the hover height to a few
+        mm below PAPER_Z without hitting a joint limit on the way."""
+        top = min(C.PAPER_Z + C.HOVER_HEIGHT, float(kin.fk_tool(self.robot.q_cmd)[0][2]))             if self.robot.q_cmd is not None else C.PAPER_Z + C.HOVER_HEIGHT
+        for z in np.arange(top, C.PAPER_Z - 3.0 - 1e-9, -1.0):
+            try:
+                kin.ik_tool((xy[0], xy[1], z), pitch)
+            except kin.IKError:
+                if not quiet:
+                    print(f"  WARNING: the stylus cannot be lowered straight down at ({xy[0]:.0f}, {xy[1]:.0f}) "
+                          f"mm (joint limits at z = {z:.0f} mm) - paper height NOT measured, "
+                          f"using PAPER_Z = {C.PAPER_Z:.1f} mm")
+                return False
+        return True
+
     def probe_surface(self, xy, pitch):
         """Lower the stylus slowly onto the paper and return the paper height.
 
@@ -538,16 +645,21 @@ class LineFollower:
         only presses lightly, and the measured tip height is the paper height.
         This needs no camera, so it also corrects a wrong PAPER_Z or camera model."""
         x, y = float(xy[0]), float(xy[1])
-        z_top = C.PAPER_Z + C.HOVER_HEIGHT
-        z_bot = C.PAPER_Z - C.PROBE_RANGE_MM
-        while True:                                            # deepest reachable point
+        # start where the tip is now (above xy) and come back there: near the edge of
+        # the reach the usual HOVER_HEIGHT above the paper may be impossible
+        z_top = min(C.PAPER_Z + C.HOVER_HEIGHT, float(kin.fk_tool(self.robot.q_cmd)[0][2]))
+        # lowest height reachable WITHOUT a gap from z_top down (with a long
+        # stylus the wrist can run into its limit half way down)
+        z_bot = z_top
+        while z_bot - 1.0 >= C.PAPER_Z - C.PROBE_RANGE_MM:
             try:
-                kin.ik_tool((x, y, z_bot), pitch)
-                break
+                kin.ik_tool((x, y, z_bot - 1.0), pitch)
             except kin.IKError:
-                z_bot += 2.0
-                if z_bot > C.PAPER_Z - 3.0:
-                    raise kin.IKError(f"cannot lower the stylus at ({x:.0f}, {y:.0f}) mm (joint limits)")
+                break
+            z_bot -= 1.0
+        if z_bot > C.PAPER_Z - 3.0:
+            raise kin.IKError(f"cannot lower the stylus at ({x:.0f}, {y:.0f}) mm with the stylus at "
+                              f"{math.degrees(pitch):.0f} deg (joint limits)")
         print(f"[PROBE] lowering the stylus onto the paper at ({x:.0f}, {y:.0f}) mm to measure its height")
         dt = 1.0 / C.CONTROL_HZ
         z_cmd, baseline, hits, at_bottom = z_top, [], 0, 0
@@ -571,8 +683,16 @@ class LineFollower:
                     if hits >= 2:
                         self.robot.hold()                      # stop pressing at once
                         print(f"  contact: paper surface at z = {z_meas:.1f} mm")
-                        tip = kin.fk_tool(self.robot.q_cmd)[0]
-                        self.robot.move_linear(tip, (x, y, z_meas + C.HOVER_HEIGHT), pitch)
+                        # Lift straight up keeping the angle the stylus REALLY has now:
+                        # pressing bends the wrist (long stylus = long lever), so the
+                        # planned angle would mean a sudden joint jump while touching.
+                        q_now = self.robot.q_cmd
+                        tip = kin.fk_tool(q_now)[0]
+                        up = (tip[0], tip[1], z_meas + (z_top - C.PAPER_Z))
+                        try:
+                            self.robot.move_linear(tip, up, kin.tool_pitch_of(q_now))
+                        except (kin.IKError, RuntimeError):
+                            self.robot.move_joints(kin.ik_tool((x, y, up[2]), pitch))
                         return z_meas
             if z_cmd <= z_bot:
                 at_bottom += 1
@@ -586,8 +706,12 @@ class LineFollower:
 
     # -- 6: plan --------------------------------------------------------------
     def plan(self, path_xy):
+        path_xy = self.correct(path_xy)                  # camera estimate -> where the stylus goes
         path = np.column_stack((path_xy, np.full(len(path_xy), self.stylus_z())))
-        lift = np.array([0.0, 0.0, C.HOVER_HEIGHT + C.PEN_DEPTH])
+        # approach / retreat height above the line ends: as high as the arm allows
+        # there (near the edge of the reach a 25 mm lift may be impossible)
+        lifts = [np.array([0.0, 0.0, h + C.PEN_DEPTH]) for h in (C.HOVER_HEIGHT, 15.0, 8.0)]
+        lift = lifts[0]
 
         def reachable(p, pitch):
             try:
@@ -596,15 +720,25 @@ class LineFollower:
             except kin.IKError:
                 return False
 
+        def vertical_ok(p, lf, pitch):
+            """Every height from the paper up to p + lf (1 mm steps): with a long
+            stylus the wrist can leave its range half way up and come back."""
+            return all(reachable(p + np.array([0.0, 0.0, h]), pitch) for h in np.arange(0.0, lf[2] + 0.01, 1.0))
+
+        def lift_for(pitch, a_pt, b_pt):
+            return next((lf for lf in lifts if vertical_ok(a_pt, lf, pitch) and vertical_ok(b_pt, lf, pitch)), None)
+
         def length(pts):
             return float(np.linalg.norm(np.diff(pts[:, :2], axis=0), axis=1).sum()) if len(pts) > 1 else 0.0
 
         chosen = None                                           # (pitch_deg, first index, end index)
         for pitch_deg in C.FOLLOW_PITCHES_DEG:                 # whole line, steepest stylus first
             pitch = math.radians(pitch_deg)
-            if all(reachable(p, pitch) for p in (*path, path[0] + lift, path[-1] + lift)):
-                chosen = (pitch_deg, 0, len(path))
-                break
+            if all(reachable(p, pitch) for p in path):
+                lf = lift_for(pitch, path[0], path[-1])
+                if lf is not None:
+                    chosen, lift = (pitch_deg, 0, len(path)), lf
+                    break
         if chosen is None and self.partial:
             # --partial (test mode): the LONGEST piece of the line the stylus can reach
             best_len = 0.0
@@ -620,9 +754,9 @@ class LineFollower:
                     while j < len(path) and ok[j]:
                         j += 1
                     a, b = i, j                                  # shrink until the lift poses work too
-                    while a < b and not reachable(path[a] + lift, pitch):
+                    while a < b and not vertical_ok(path[a], lifts[-1], pitch):
                         a += 1
-                    while b > a and not reachable(path[b - 1] + lift, pitch):
+                    while b > a and not vertical_ok(path[b - 1], lifts[-1], pitch):
                         b -= 1
                     if length(path[a:b]) > best_len + 1e-6:
                         best_len, chosen = length(path[a:b]), (pitch_deg, a, b)
@@ -630,11 +764,17 @@ class LineFollower:
             if chosen is not None and best_len < 20.0:
                 chosen = None
             if chosen is not None:
+                lift = lift_for(math.radians(chosen[0]), path[chosen[1]], path[chosen[2] - 1])
                 start = length(path[:chosen[1] + 1])
                 print(f"  PARTIAL: following {best_len:.0f} mm of the {length(path):.0f} mm line, starting "
                       f"{start:.0f} mm after the dot (the rest is out of reach of the stylus)")
         if chosen is None:
-            bad = next((p for p in path if not self.stylus_can_reach(p[:2])), path[0])
+            bad = next((p for p in path if not self.stylus_can_reach(p[:2])), None)
+            if bad is None:
+                raise kin.IKError(
+                    "every point of the line can be reached, but not all with ONE stylus angle (tried "
+                    f"{', '.join(str(p) for p in C.FOLLOW_PITCHES_DEG)} deg) plus room to lift the stylus at "
+                    "the ends. Move the sheet about 1 cm closer to the robot - or test with --partial")
             raise kin.IKError(self.reach_message(bad[:2], "part of the line") +
                               ". Move the sheet (or redraw the line) so that the whole line lies in that "
                               "ring - or test the motion with --partial")
@@ -656,7 +796,9 @@ class LineFollower:
         if self.dry:
             print(f"  --dry: no touching; the line is traced with the stylus tip {C.DRY_HOVER_MM:.0f} mm "
                   "above the paper")
-        elif C.PROBE_PAPER:
+        elif self.paper_probed:
+            print(f"  paper height measured while teaching: z = {C.PAPER_Z:.1f} mm")
+        elif C.PROBE_PAPER and self.can_probe(path[0][:2], pitch):
             z = self.probe_surface(path[0][:2], pitch)
             if abs(z - C.PAPER_Z) >= C.PAPER_Z_TOLERANCE_MM:
                 print(f"  paper is {abs(z - C.PAPER_Z):.1f} mm {'higher' if z > C.PAPER_Z else 'lower'} "
@@ -674,6 +816,7 @@ class LineFollower:
                 self.robot.move_joints(kin.ik_tool(path[0] + lift, pitch))
             else:
                 print(f"  paper height confirmed: z = {z:.1f} mm")
+                self.robot.move_joints(kin.ik_tool(path[0] + lift, pitch))   # back to the planned stylus angle
         base = self.line_map.render(line["path"], line["dot"])
         self.ui.show("map", base)
         self.robot.move_linear(path[0] + lift, path[0], pitch, speed=C.LINEAR_SPEED_MM_S / 2,
@@ -693,8 +836,254 @@ class LineFollower:
         self.go_camera(C.HOME_CAMERA_XY)
         return line, plan
 
+    def acquire_with_retry(self, auto):
+        """acquire_line(), but if the line cannot be locked the arm goes back to
+        the home view and WAITS: the user can move the sheet into the live view
+        and try again, instead of the program quitting."""
+        while True:
+            try:
+                return self.acquire_line()
+            except (vis.VisionError, kin.IKError) as e:
+                if auto:
+                    raise
+                print()
+                print(f"  NOT LOCKED: {e}")
+                self.go_camera(C.HOME_CAMERA_XY)
+                if not self.ui.wait_retry("  Move / straighten the sheet so the line and the big dot are in the "
+                                          "'camera (live)' window (dot on the paper, not cut off)."):
+                    raise
+                print()
+                print("[RETRY]")
+                self.mosaic = vis.Mosaic(self.cam)
+                self.line_map = self.mosaic
+                self.last_view_map = None
+
+    # -- teach: measure the camera error with the stylus -------------------------
+    TEACH_HOVER_MM = 4.0          # tip height above the (probed) paper while teaching
+    TEACH_HOVER_DRY_MM = 10.0     # ... with --dry (paper height not measured)
+    JOG_KEYS = {ord("w"): (1.0, 0.0), ord("s"): (-1.0, 0.0), ord("a"): (0.0, 1.0), ord("d"): (0.0, -1.0)}
+
+    def correct(self, xy):
+        """Camera estimate (mm, frame 0) -> where the stylus has to go, using the
+        correction measured by --teach (identity if there is none)."""
+        xy = np.asarray(xy, float)
+        if self.correction is None:
+            return xy
+        M = np.asarray(self.correction["matrix"], float)
+        return (xy.reshape(-1, 2) @ M[:, :2].T + M[:, 2]).reshape(xy.shape)
+
+    def jog(self, start_xy, z, pitch, what):
+        """The user moves the stylus tip (z fixed) exactly over a mark; returns its xy."""
+        xy = np.array(start_xy, float)
+        self.robot.move_joints(kin.ik_tool((xy[0], xy[1], z + 15.0), pitch))
+        self.robot.move_linear((xy[0], xy[1], z + 15.0), (xy[0], xy[1], z), pitch)
+        print(f"\n  Put the stylus tip exactly over the {what}.")
+        if self.ui.enabled:
+            print("  Keys in an image window: w / s = 1 mm away from / towards the robot, "
+                  "a / d = 1 mm to the robot's left / right\n"
+                  "  (W A S D = 5 mm). 'g' = this is the spot, 'q' = stop.")
+        while True:
+            if self.ui.enabled:
+                key = self.ui.poll()
+                if key in (ord("g"), 13, 32):
+                    break
+                lower = key + 32 if 65 <= key <= 90 else key
+                if lower not in self.JOG_KEYS:
+                    time.sleep(0.03)
+                    continue
+                move = np.array(self.JOG_KEYS[lower]) * (5.0 if lower != key else 1.0)
+            else:
+                cmd = input("  move ('x+2' = 2 mm away from the robot, 'y-1' = 1 mm to its right, "
+                            "'x-1 y+3' ...) or 'ok': ").strip().lower()
+                if cmd in ("ok", "g", ""):
+                    break
+                move = np.zeros(2)
+                try:
+                    for part in cmd.replace(",", " ").split():
+                        move["xy".index(part[0])] += float(part[1:])
+                except (ValueError, IndexError):
+                    print("  ? write e.g. x+2 or y-1.5 or ok")
+                    continue
+            new = xy + move
+            try:
+                # quick nudge: 0.2 s straight line, no waiting for the servos to settle
+                # (holding a key down keeps the tip moving)
+                n = max(5, int(math.ceil(np.linalg.norm(move) / 1.0)))     # samples <= 1 mm apart
+                qs = [kin.ik_tool((*(xy + s * move), z), pitch) for s in np.linspace(1.0 / n, 1.0, n)]
+                steps = np.abs(np.diff(np.vstack([self.robot.q_cmd] + qs), axis=0))
+                if np.degrees(steps.max()) > C.MAX_JOINT_STEP_DEG:      # check BEFORE moving at all
+                    raise RuntimeError("the arm would have to jump (edge of the reach)")
+                self.robot.stream(qs)
+                xy = new
+            except (kin.IKError, RuntimeError) as e:
+                # out of reach with this stylus angle: tilt the stylus (in the air) to the
+                # first angle of FOLLOW_PITCHES_DEG that reaches the new spot, then go on
+                new_pitch = self._pitch_reaching(new, z, pitch)
+                if new_pitch is None:
+                    print(f"  cannot go there with any stylus angle ({e})")
+                else:
+                    self._change_pitch(xy, new, z, pitch, new_pitch)
+                    pitch, xy = new_pitch, new
+                    print(f"  (stylus tilted to {math.degrees(pitch):.0f} deg to reach this spot)")
+            d = xy - start_xy
+            print(f"  tip at ({xy[0]:.1f}, {xy[1]:.1f}) mm = camera estimate {d[0]:+.1f} / {d[1]:+.1f} mm")
+        for up in (15.0, 10.0, 5.0):                     # lift off (as high as the wrist allows here)
+            try:
+                self.robot.move_linear((xy[0], xy[1], z), (xy[0], xy[1], z + up), pitch)
+                break
+            except kin.IKError:
+                continue
+        return xy
+
+    def _column_ok(self, xy, z_lo, z_hi, pitch):
+        """The stylus can stand at xy at every height z_lo..z_hi (1 mm steps)."""
+        try:
+            for zz in np.arange(z_lo, z_hi + 0.01, 1.0):
+                kin.ik_tool((xy[0], xy[1], zz), pitch)
+            return True
+        except kin.IKError:
+            return False
+
+    def _pitch_reaching(self, xy, z, current):
+        """First stylus angle (FOLLOW_PITCHES_DEG) other than `current` that reaches
+        xy at the jog height and 5 mm above it, or None."""
+        for pd in C.FOLLOW_PITCHES_DEG:
+            p = math.radians(pd)
+            if abs(p - current) > 1e-6 and self._column_ok(xy, z, z + 5.0, p):
+                return p
+        return None
+
+    def _change_pitch(self, xy_from, xy_to, z, old, new):
+        """Lift (as far as possible at the old angle), turn the stylus to the new
+        angle above the new spot in the air, come down again."""
+        up = next((dz for dz in (15.0, 10.0, 5.0, 0.0) if self._column_ok(xy_from, z, z + dz, old)
+                   and self._column_ok(xy_to, z, z + dz, new)), 0.0)
+        if up > 0:
+            try:
+                self.robot.move_linear((xy_from[0], xy_from[1], z), (xy_from[0], xy_from[1], z + up), old)
+            except (kin.IKError, RuntimeError):
+                pass                                    # turn without lifting first
+        self.robot.move_joints(kin.ik_tool((xy_to[0], xy_to[1], z + up), new))
+        if up > 0:
+            self.robot.move_linear((xy_to[0], xy_to[1], z + up), (xy_to[0], xy_to[1], z), new)
+
+    @staticmethod
+    def correction_from_pairs(pairs):
+        """Camera estimate -> stylus position, from the taught point pairs.
+
+        3+ points (dot, top of the curve, end): AFFINE map (shift, rotation,
+        scale and shear) - also corrects a camera model that squeezes far points
+        more than near ones. 2 points: similarity (shift + rotation + scale).
+        Implausible fits fall back to the simpler model, finally a plain shift."""
+        V = np.array([p[0] for p in pairs], float)
+        Rr = np.array([p[1] for p in pairs], float)
+        t = (Rr - V).mean(axis=0)
+        M, kind = np.array([[1.0, 0.0, t[0]], [0.0, 1.0, t[1]]]), "shift"
+        if len(pairs) >= 3:
+            e1, e2 = V[1] - V[0], V[2] - V[0]
+            area = abs(e1[0] * e2[1] - e1[1] * e2[0]) / 2.0
+            if area > 300.0:                                       # the points span a real triangle
+                X = np.linalg.lstsq(np.column_stack((V, np.ones(len(V)))), Rr, rcond=None)[0].T   # 2 x 3
+                U, sv, Wt = np.linalg.svd(X[:, :2])
+                rot = math.degrees(math.atan2((U @ Wt)[1, 0], (U @ Wt)[0, 0]))
+                if 0.7 < sv.min() and sv.max() < 1.45 and abs(rot) < 15.0:
+                    return X, f"affine (scale {sv.min():.3f}..{sv.max():.3f}, rotation {rot:+.1f} deg)"
+        if len(pairs) >= 2:
+            d = np.linalg.norm(V[:, None] - V[None], axis=2)
+            i0, i1 = np.unravel_index(np.argmax(d), d.shape)        # the two points farthest apart
+            if d[i0, i1] > 30.0:
+                v = V[[i0, i1], 0] + 1j * V[[i0, i1], 1]
+                r = Rr[[i0, i1], 0] + 1j * Rr[[i0, i1], 1]
+                a = (r[1] - r[0]) / (v[1] - v[0])
+                b = r[0] - a * v[0]
+                if 0.75 < abs(a) < 1.35 and abs(math.degrees(np.angle(a))) < 12.0:
+                    M = np.array([[a.real, -a.imag, b.real], [a.imag, a.real, b.imag]])
+                    kind = f"shift + rotation {math.degrees(np.angle(a)):+.1f} deg + scale {abs(a):.3f}"
+        return M, kind
+
+    def teach(self, line):
+        """Measure where the stylus really has to go for the start dot and the
+        end of the line (the user moves the tip there), and store the
+        correction camera -> stylus in CORRECTION_FILE for this and later runs."""
+        print("\n[TEACH] measuring the camera error with the stylus")
+        dot, end = line["path"][0], line["path"][-1]
+        # 3rd point: the point of the line farthest from the straight dot-end chord
+        # (the top of the curve). With 3 points the correction also undoes a camera
+        # model that squeezes far points more than near ones.
+        chord = end - dot
+        off = np.abs(chord[0] * (line["path"][:, 1] - dot[1]) - chord[1] * (line["path"][:, 0] - dot[0])) / max(np.linalg.norm(chord), 1e-6)
+        mid = line["path"][int(np.argmax(off))]
+        pitch = None
+        heights = np.arange(C.PAPER_Z + self.TEACH_HOVER_MM, C.PAPER_Z + self.TEACH_HOVER_DRY_MM + 15.0 + 0.01, 1.0)
+        for pd in C.FOLLOW_PITCHES_DEG:                      # every height the jog will use, all points
+            try:
+                for p in (dot, mid, end):
+                    for z in heights:
+                        kin.ik_tool((*self.correct(p), z), math.radians(pd))
+                pitch = math.radians(pd)
+                break
+            except kin.IKError:
+                continue
+        if pitch is None:
+            raise kin.IKError("the stylus cannot reach the start dot and the end of the line to teach them")
+        if not self.dry and C.PROBE_PAPER:
+            probe_pitch = next((math.radians(pd) for pd in C.FOLLOW_PITCHES_DEG
+                                if self.can_probe(self.correct(dot), math.radians(pd), quiet=True)), None)
+        if not self.dry and C.PROBE_PAPER and probe_pitch is not None:
+            p = self.correct(dot)
+            self.robot.move_joints(kin.ik_tool((p[0], p[1], C.PAPER_Z + C.HOVER_HEIGHT), probe_pitch))
+            z = self.probe_surface(p, probe_pitch)
+            self.paper_probed = True
+            if abs(z - C.PAPER_Z) >= C.PAPER_Z_TOLERANCE_MM:
+                C.PAPER_Z = z
+                self.line_map.rebuild(z)
+                try:
+                    new_line = vis.extract_line(self.line_map)
+                    if new_line["path"] is not None:
+                        line = new_line
+                        dot, end = line["path"][0], line["path"][-1]
+                        chord = end - dot
+                        off = np.abs(chord[0] * (line["path"][:, 1] - dot[1]) - chord[1] * (line["path"][:, 0] - dot[0])) / max(np.linalg.norm(chord), 1e-6)
+                        mid = line["path"][int(np.argmax(off))]
+                except vis.VisionError as e:
+                    print(f"  (keeping the previous line: {e})")
+            hover = C.PAPER_Z + self.TEACH_HOVER_MM
+        else:
+            hover = C.PAPER_Z + self.TEACH_HOVER_DRY_MM
+        names = ["start dot"]
+        pairs = [(dot, self.jog(self.correct(dot), hover, pitch, "CENTRE of the start dot"))]
+        if off.max() > 10.0:                              # a curved line: also its top
+            names.append("top of curve")
+            pairs.append((mid, self.jog(self.correct(mid), hover, pitch,
+                                        "TOP of the curve (move straight onto the centre of the line, "
+                                        "to its nearest point)")))
+        names.append("line end")
+        pairs.append((end, self.jog(self.correct(end), hover, pitch,
+                                    "END of the line (centre of the line, 2-3 mm before its tip)")))
+        M, kind = self.correction_from_pairs(pairs)
+        self.correction = dict(matrix=M.tolist(), kind=kind,
+                               pairs=[[*np.round(v, 2), *np.round(r, 2)] for v, r in pairs],
+                               taught=time.strftime("%Y-%m-%d %H:%M"))
+        for (v, r), name in zip(pairs, names):
+            print(f"  {name}: camera said ({v[0]:.1f}, {v[1]:.1f}), stylus needed ({r[0]:.1f}, {r[1]:.1f}) "
+                  f"-> error {r[0] - v[0]:+.1f} / {r[1] - v[1]:+.1f} mm")
+        print(f"  correction: {kind}")
+        if self.correction_file:
+            with open(self.correction_file, "w", encoding="utf-8") as f:
+                json.dump(self.correction, f, indent=1)
+            print(f"  saved in {self.correction_file} (used automatically from now on; "
+                  "delete the file or --teach again to redo)")
+        return line
+
     def run(self, auto=False):
-        line = self.acquire_line()
+        line = self.acquire_with_retry(auto)
+        if self.teach_mode:
+            if auto:
+                raise RuntimeError("--teach needs you at the keyboard; do not combine it with --auto")
+            line = self.teach(line)
+        elif self.correction is not None:
+            print(f"  using the taught camera correction ({self.correction.get('kind', '?')}, "
+                  f"{self.correction.get('taught', '?')})")
         plan = self.plan(line["path"])
         self.ui.show("map", self.line_map.render(line["path"], line["dot"]))
         if not auto and not self.ui.confirm("Planned path is shown in the 'map' window "
@@ -751,15 +1140,43 @@ def check_joints(arm, robot):
 
 def check_camera(task):
     print("Camera check: the yellow dots are a 20 mm grid ON THE TABLE (frame 0),\n"
-          "the arrow points towards the robot base. Click a point in the image,\n"
-          "press 't' to put the stylus 3 mm above it, 'b' to come back, 'q' to quit.")
+          "the arrow points towards the robot base.\n"
+          "  p          = find the 4 CORNERS of the sheet and print where they are (mm)\n"
+          "  click, or move the red cross with i/j/k/l (I/J/K/L = finer) and press ENTER\n"
+          "             = print where that point is (mm)\n"
+          "  t = put the stylus 3 mm above the point, b = back to the home view, q = quit\n"
+          "Measure the same points with a ruler from the CENTRE of the base:\n"
+          "  x = straight forward, y = to the robot's LEFT.")
     cam, robot = task.cam, task.robot
     task.ui.live = None                 # this mode shows its own live window
     clicked = {"uv": None}
+    T0c = None
+
+    def report(uv, name="point"):
+        P = cam.pixel_to_plane(T0c, [uv])[0]
+        if np.all(np.isfinite(P)):
+            print(f"  {name} at pixel ({uv[0]:.0f}, {uv[1]:.0f}) -> table x = {P[0]:.1f} mm, y = {P[1]:.1f} mm "
+                  f"({math.hypot(P[0], P[1]):.0f} mm from the base)")
+        else:
+            print(f"  {name} at pixel ({uv[0]:.0f}, {uv[1]:.0f}) does not look at the table")
 
     def on_mouse(event, x, y, *_):
         if event == cv2.EVENT_LBUTTONDOWN:
             clicked["uv"] = (x, y)
+            report(clicked["uv"])
+
+    def sheet_corners(img):
+        """The corners of the sheet in the image (paper mask -> polygon)."""
+        m, frac = vis.paper_mask(img)
+        if frac < C.PAPER_MIN_AREA_FRACTION:
+            return []
+        cnt = max(cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0], key=cv2.contourArea)
+        for eps in (0.01, 0.02, 0.03, 0.05, 0.08):
+            poly = cv2.approxPolyDP(cnt, eps * cv2.arcLength(cnt, True), True)[:, 0]
+            if len(poly) <= 6:
+                break
+        return [((int(u), int(v)), u <= 2 or v <= 2 or u >= cam.width - 3 or v >= cam.height - 3)
+                for u, v in poly]
 
     g = np.arange(-300, 301, 20.0)
     GX, GY = np.meshgrid(g, g)
@@ -785,21 +1202,44 @@ def check_camera(task):
         return T, layer, layer.any(axis=2)
 
     task.go_camera(C.HOME_CAMERA_XY)
-    cv2.namedWindow("camera")
-    cv2.setMouseCallback("camera", on_mouse)
     T0c, layer, drawn = overlay_for_current_pose()
+    cv2.namedWindow("camera", cv2.WINDOW_AUTOSIZE)
+    cv2.imshow("camera", task.camera.read())
+    cv2.waitKey(1)
+    cv2.setMouseCallback("camera", on_mouse)            # after the window really exists
+    clicked["uv"] = (cam.width // 2, cam.height // 2)
+    marks = []                                          # sheet corners found with 'p'
+    touch = None                                        # stylus over a clicked point (t)
+    pairs = []                                          # stored (pixel, real position) pairs (g)
+    moves = {ord("i"): (0, -1), ord("k"): (0, 1), ord("j"): (-1, 0), ord("l"): (1, 0)}
     while True:
-        img = task.camera.read()
+        img = task.camera.read().copy()
         img[drawn] = layer[drawn]
-        if clicked["uv"] is not None:
-            P = cam.pixel_to_plane(T0c, [clicked["uv"]])[0]
-            cv2.drawMarker(img, clicked["uv"], (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
-            cv2.putText(img, f"({P[0]:.1f}, {P[1]:.1f}) mm", (10, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        for (uv, at_border), name in zip(marks, "ABCDEFGH"):
+            cv2.circle(img, uv, 7, (128, 128, 128) if at_border else (255, 0, 0), 2)
+            cv2.putText(img, name, (uv[0] + 6, uv[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        P = cam.pixel_to_plane(T0c, [clicked["uv"]])[0]
+        cv2.drawMarker(img, tuple(int(c) for c in clicked["uv"]), (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
+        cv2.putText(img, f"({P[0]:.1f}, {P[1]:.1f}) mm", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         cv2.imshow("camera", img)
         key = cv2.waitKey(15) & 0xFF
         if key in (27, ord("q")):
             return
+        low = key + 32 if 65 <= key <= 90 else key
+        if low in moves:
+            step = 10 if low == key else 1
+            clicked["uv"] = (int(np.clip(clicked["uv"][0] + moves[low][0] * step, 0, cam.width - 1)),
+                             int(np.clip(clicked["uv"][1] + moves[low][1] * step, 0, cam.height - 1)))
+        if key in (13, 10):
+            report(clicked["uv"])
+        if key == ord("p"):
+            marks = sheet_corners(task.camera.read())
+            if not marks:
+                print("  no sheet found in the image")
+            else:
+                print("  sheet corners (grey circle = where the sheet leaves the image, not a real corner):")
+            for (uv, at_border), name in zip(marks, "ABCDEFGH"):
+                report(uv, f"corner {name}{' (image border)' if at_border else ''}")
         if key == ord("t") and clicked["uv"] is not None:
             P = cam.pixel_to_plane(T0c, [clicked["uv"]])[0]
             if not np.all(np.isfinite(P)):
@@ -817,14 +1257,102 @@ def check_camera(task):
                 print(f"point ({P[0]:.0f}, {P[1]:.0f}) mm is not reachable with the stylus "
                       "(joint limits) - click a point about 100-190 mm in front of the base")
                 continue
+            touch = dict(uv=clicked["uv"], T0c=T0c.copy(), est=P[:2].copy(), xy=P[:2].copy(),
+                         pitch=math.radians(pd), z=C.PAPER_Z + 3.0)
             robot.move_joints(q_hover)
             robot.move_joints(q)
             T0c, layer, drawn = overlay_for_current_pose()
-            print(f"stylus 3 mm above ({P[0]:.1f}, {P[1]:.1f}) mm (stylus angle {pd} deg) - "
-                  "is it on your mark? press 'b' to go back")
+            print(f"stylus 3 mm above ({P[0]:.1f}, {P[1]:.1f}) mm (stylus angle {pd} deg).")
+            print("  Not on your mark? Move it with w / s (away from / towards the robot), a / d (robot's "
+                  "left / right), 1 mm per key (W A S D = 5 mm),")
+            print("  then press g to store this point (or b to go back without storing).")
+        low2 = key + 32 if 65 <= key <= 90 else key
+        if touch is not None and low2 in task.JOG_KEYS:
+            move = np.array(task.JOG_KEYS[low2]) * (5.0 if low2 != key else 1.0)
+            try:
+                qs = [kin.ik_tool((*(touch["xy"] + s_ * move), touch["z"]), touch["pitch"])
+                      for s_ in np.linspace(0.2, 1.0, 5)]
+                robot.stream(qs)
+                touch["xy"] = touch["xy"] + move
+                d = touch["xy"] - touch["est"]
+                print(f"  tip at ({touch['xy'][0]:.1f}, {touch['xy'][1]:.1f}) mm = camera estimate "
+                      f"{d[0]:+.1f} / {d[1]:+.1f} mm")
+            except (kin.IKError, RuntimeError) as e:
+                print(f"  cannot go there: {e}")
+        if key == ord("g") and touch is not None:
+            pairs.append(dict(uv=touch["uv"], T0c=touch["T0c"], true=touch["xy"].copy()))
+            d = touch["xy"] - touch["est"]
+            print(f"  point {len(pairs)} stored: camera said ({touch['est'][0]:.1f}, {touch['est'][1]:.1f}), "
+                  f"real ({touch['xy'][0]:.1f}, {touch['xy'][1]:.1f}) -> error {d[0]:+.1f} / {d[1]:+.1f} mm. "
+                  f"{'Take 3-4 points spread over the sheet, then press f.' if len(pairs) < 3 else 'Press f to fit.'}")
+            touch = None
+            key = ord("b")
         if key == ord("b"):
+            touch = None
             task.go_camera(C.HOME_CAMERA_XY)
             T0c, layer, drawn = overlay_for_current_pose()
+        if key == ord("f"):
+            if len(pairs) < 2:
+                print("  store at least 2 points first (3-4 spread over the sheet is better)")
+                continue
+            fix = fit_camera_fix(cam, pairs)
+            if fix is not None:
+                T0c, layer, drawn = overlay_for_current_pose()
+
+
+def fit_camera_fix(cam, pairs):
+    """Small rotation of the camera on its mount that makes the clicked pixels
+    land where the stylus really had to go (least squares, Gauss-Newton). The
+    result is applied at once and written to CAMERA_FIX_DEG in config.py."""
+    def err(r):
+        R = kin.rotvec_matrix(np.radians(r))
+        out = []
+        for p in pairs:
+            T = p["T0c"].copy()
+            T[:3, :3] = T[:3, :3] @ R
+            P = cam.pixel_to_plane(T, [p["uv"]])[0][:2]
+            out.append(np.nan_to_num(P - p["true"], nan=1e3))
+        return np.concatenate(out)
+    # only tilt about the image right / down axes: a turn about the optical axis
+    # (image roll) is hard to tell from errors of the stylus itself and gave
+    # wrong results (sheet seen turned by 15 deg)
+    r = np.zeros(3)
+    e0 = err(r)
+    for _ in range(30):
+        e = err(r)
+        J = np.column_stack([(err(r + np.eye(3)[i] * 0.05) - e) / 0.05 for i in range(2)])
+        dr = np.linalg.lstsq(J.T @ J + 1e-3 * np.eye(2), -J.T @ e, rcond=None)[0]
+        r = r + np.append(dr, 0.0)
+        if np.abs(dr).max() < 1e-4:
+            break
+    e1 = err(r)
+    rms = lambda v: float(np.sqrt(np.mean(v.reshape(-1, 2) ** 2) * 2))     # noqa: E731
+    print(f"  camera tilt correction ({r[0]:+.2f}, {r[1]:+.2f}) deg: error {rms(e0):.1f} mm -> "
+          f"{rms(e1):.1f} mm over {len(pairs)} points")
+    if np.abs(r).max() > 25.0 or rms(e1) > 0.6 * rms(e0) + 2.0:
+        print("  this does not fit well (wrong point stored?) - NOT applied. Press b, store the points again.")
+        return None
+    R_new = kin.T5C[:3, :3] @ kin.rotvec_matrix(np.radians(r))
+    R_nom = kin._camera_rotation_in_f5()
+    fix_vec, _ = cv2.Rodrigues(R_nom.T @ R_new)
+    fix_deg = np.degrees(fix_vec.ravel())
+    kin.T5C[:3, :3] = R_new                                    # use it right away
+    ax = kin.T5C[:3, 2]
+    kin.CAMERA_AXIS_OFFSET = None if abs(ax[2]) > 0.5 else math.atan2(ax[1], ax[0])
+    C.CAMERA_FIX_DEG = tuple(float(v) for v in fix_deg)
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.py")
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    import re
+    text, n = re.subn(r"^CAMERA_FIX_DEG = \([^)]*\)", "CAMERA_FIX_DEG = (%.2f, %.2f, %.2f)" % tuple(fix_deg),
+                      text, flags=re.M)
+    if n:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"  saved CAMERA_FIX_DEG = ({fix_deg[0]:.2f}, {fix_deg[1]:.2f}, {fix_deg[2]:.2f}) in config.py "
+              "(applied now). Click + t again to check; delete vision_correction.json and teach again.")
+    pairs.clear()
+    return fix_deg
 
 
 def camera_only(camera, ui):
@@ -857,6 +1385,10 @@ def main():
     ap.add_argument("--partial", action="store_true",
                     help="TEST MODE: if the line is longer than the stylus can reach, follow the "
                          "reachable part from the dot instead of stopping")
+    ap.add_argument("--teach", action="store_true",
+                    help="after locking the line, move the stylus tip onto the start dot and the line end "
+                         "with the keyboard; the camera error measured this way is saved and corrected "
+                         "in every later run")
     args = ap.parse_args()
     if args.paper_z is not None:
         C.PAPER_Z = args.paper_z
@@ -906,6 +1438,12 @@ def main():
         task = LineFollower(robot, camera, ui, realtime, "debug_sim" if args.sim else "debug")
         task.partial = args.partial
         task.dry = args.dry
+        task.teach_mode = args.teach
+        if not args.sim:                     # the simulator never uses / overwrites the real correction
+            task.correction_file = C.CORRECTION_FILE
+            if os.path.exists(C.CORRECTION_FILE):
+                with open(C.CORRECTION_FILE, encoding="utf-8") as f:
+                    task.correction = json.load(f)
         print(f"  images used for every decision are saved in {task.debug_dir}")
         if args.check_camera:
             check_camera(task)

@@ -14,6 +14,7 @@ Pipeline
                     breadth-first search starting at the dot.
 """
 
+import math
 from collections import deque
 
 import cv2
@@ -50,17 +51,73 @@ def _convex_fill(mask):
     return out
 
 
+def paper_threshold(hsv):
+    """Minimum brightness (HSV V) of paper, adapted to the lighting.
+
+    The paper is grey in a dim room (V ~ 130) and the table can be as bright
+    as 130 in a bright one, so no fixed value works. The black ink, the text
+    and deep shadows are removed first (else the split is "ink / everything
+    else" and the table counts as paper). Then Otsu's threshold splits the
+    rest into a darker group (table) and a brighter one (paper). If the two
+    groups are not clearly different, only paper (or only table) is in view
+    and PAPER_ONLY_RATIO x the paper brightness is used."""
+    v = hsv[..., 2][hsv[..., 1] <= C.PAPER_MAX_SATURATION]
+    if v.size < 100:
+        return C.PAPER_MIN_VALUE
+    bright = float(np.percentile(v, 95))
+    v = v[v > 0.6 * bright]                                # drop ink, text, deep shadows
+    if v.size < 100:
+        return C.PAPER_MIN_VALUE
+    t, _ = cv2.threshold(v.reshape(-1, 1).astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    lo, hi = v[v <= t], v[v > t]
+    two_groups = (lo.size > 0.05 * v.size and hi.size > 0.05 * v.size
+                  and float(hi.mean()) - float(lo.mean()) >= C.PAPER_TABLE_CONTRAST)
+    thr = t + 1 if two_groups else C.PAPER_ONLY_RATIO * bright
+    return int(max(C.PAPER_MIN_VALUE_FLOOR, min(thr, C.PAPER_RELATIVE_VALUE * bright)))
+
+
+def _paper_mask_edges(frame, hsv):
+    """Sheet = the bright region enclosed by SHARP brightness edges.
+
+    Shading across the sheet (one side 25 % darker than the other) can make
+    paper as dark as the table, so no brightness threshold separates them.
+    But the sheet border is a sudden step in brightness, while shading changes
+    slowly. Canny edges (blurred image) mark the border; the low-saturation,
+    not-too-dark pixels are split into regions along those edges, and the
+    brightest large region - plus other large regions almost as bright (parts
+    of the sheet separated by the black line) - is the sheet."""
+    V, S = hsv[..., 2], hsv[..., 1]
+    low = S <= C.PAPER_MAX_SATURATION
+    if np.count_nonzero(low) < 100:
+        return None
+    bright = float(np.percentile(V[low], 95))
+    cand = low & (V >= max(C.PAPER_MIN_VALUE_FLOOR, C.PAPER_LENIENT_RATIO * bright))
+    edges = cv2.Canny(cv2.GaussianBlur(V, (5, 5), 0), *C.PAPER_EDGE_CANNY)
+    free = (cand & (cv2.dilate(edges, np.ones((3, 3), np.uint8)) == 0)).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(free, 4)
+    big = [i for i in range(1, n) if st[i, cv2.CC_STAT_AREA] >= 0.005 * free.size]
+    if not big:
+        return None
+    med = {i: float(np.median(V[lab == i])) for i in big}
+    top = max(big, key=lambda i: med[i] * st[i, cv2.CC_STAT_AREA] ** 0.25)
+    keep = [i for i in big if med[i] >= C.PAPER_SAME_RATIO * med[top]]
+    return np.isin(lab, keep).astype(np.uint8) * 255
+
+
 def paper_mask(frame):
     """Mask of the A4 sheet in the image and its area fraction.
 
-    A thick pen line or a crease cuts the white area into pieces (e.g. a thin
-    strip between the line and the image edge). So dark gaps up to ~5 % of the
-    image width are bridged first, then all large white pieces are kept and
-    their convex hull is used (the sheet is a rectangle, which stays convex in
-    a perspective image).
+    The sheet region comes from _paper_mask_edges() (robust to shading); if
+    that finds nothing, from a brightness threshold (paper_threshold). A thick
+    pen line or a crease cuts the white area into pieces, so dark gaps up to
+    ~5 % of the image width are bridged, then all large white pieces are kept
+    and their convex hull is used (the sheet is a rectangle, which stays
+    convex in a perspective image).
     """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    white = cv2.inRange(hsv, (0, 0, C.PAPER_MIN_VALUE), (180, C.PAPER_MAX_SATURATION, 255))
+    white = _paper_mask_edges(frame, hsv)
+    if white is None:
+        white = cv2.inRange(hsv, (0, 0, paper_threshold(hsv)), (180, C.PAPER_MAX_SATURATION, 255))
     white = cv2.morphologyEx(white, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     k = max(15, int(0.05 * frame.shape[1]) | 1)
     white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
@@ -99,6 +156,7 @@ class Mosaic:
         self.shape = X.shape
         self.XY = np.column_stack((X.ravel(), Y.ravel()))
         self.frames = []                                  # (frame, T0c) of every view
+        self.aligns = []                                  # alignment used for every view (or None)
         self.reset(C.PAPER_Z)
 
     def reset(self, z_plane):
@@ -113,11 +171,11 @@ class Mosaic:
 
     def rebuild(self, z_plane):
         """Re-project all stored views onto a plane at a different height."""
-        frames = self.frames
-        self.frames = []
+        frames, aligns = self.frames, getattr(self, "aligns", [None] * len(self.frames))
+        self.frames, self.aligns = [], []
         self.reset(z_plane)
-        for frame, T0c in frames:
-            self.add_view(frame, T0c)
+        for (frame, T0c), align in zip(frames, aligns):
+            self.add_view(frame, T0c, align)
 
     # grid <-> world
     def to_world(self, rc):
@@ -130,9 +188,24 @@ class Mosaic:
         return np.column_stack(((xy[:, 1] - self.ys[0]) / self.res,
                                 (xy[:, 0] - self.xs[0]) / self.res))
 
-    def add_view(self, frame, T0c):
+    def add_view(self, frame, T0c, align=None):
+        """Project one camera image onto the table map.
+
+        align = (R, t): the view is first moved by the rigid 2-D transform
+        p -> R p + t (mm, frame 0), found by align_view(), so that its line
+        lies on the line of the views already in the map. Small calibration
+        errors otherwise place the same line a few mm apart in different
+        views and the combined map shows it doubled."""
         self.frames.append((frame, np.array(T0c, float)))
-        uv, depth = self.cam.project(T0c, self.P)
+        if not hasattr(self, "aligns"):
+            self.aligns = []
+        self.aligns.append(align)
+        P = self.P
+        if align is not None:
+            R, t = align
+            xy = (self.XY - t) @ R                        # R^T (p - t): the same point before the move
+            P = np.column_stack((xy, np.full(len(xy), self.z_plane)))
+        uv, depth = self.cam.project(T0c, P)
         b = C.IMAGE_BORDER_PX
         inside = ((depth > 1) & (uv[:, 0] >= b) & (uv[:, 0] <= self.cam.width - 1 - b)
                   & (uv[:, 1] >= b) & (uv[:, 1] <= self.cam.height - 1 - b))
@@ -141,6 +214,12 @@ class Mosaic:
             return
         mx = np.nan_to_num(uv[:, 0], nan=-1).reshape(self.shape).astype(np.float32)
         my = np.nan_to_num(uv[:, 1], nan=-1).reshape(self.shape).astype(np.float32)
+        # the black corners/edges left by the lens undistortion are not seen
+        # (cam.valid: computed once from the calibration, NOT from the image,
+        # whose black ink can be pure black too)
+        valid = getattr(self.cam, "valid", None)
+        if valid is not None:
+            inside &= cv2.remap(valid.astype(np.float32), mx, my, cv2.INTER_NEAREST) > 0.5
 
         paper, _ = paper_mask(frame)
         dark = dark_mask(frame, paper)
@@ -166,8 +245,15 @@ class Mosaic:
         m = _convex_fill(m)                                # the sheet is a rectangle
         if not erode:
             return m
+        # shrink at the REAL edges of the sheet (shadows), but not where the map
+        # just ends because the camera did not see further: a line that runs out
+        # of the picture must keep its ink right up to the edge of the view
         e = max(1, int(round(C.PAPER_EDGE_ERODE_MM / self.res)))
-        return cv2.erode(m, np.ones((2 * e + 1, 2 * e + 1), np.uint8))
+        k = np.ones((2 * e + 1, 2 * e + 1), np.uint8)
+        eroded = cv2.erode(m, k)
+        view_edge = cv2.dilate((~self.seen_mask()).astype(np.uint8), np.ones((4 * e + 1, 4 * e + 1), np.uint8)) > 0
+        far_from_sheet_edge = cv2.erode(cv2.bitwise_or(m, np.where(view_edge, 255, 0).astype(np.uint8)), k) > 0
+        return np.where(view_edge & far_from_sheet_edge & (m > 0), 255, eroded).astype(np.uint8)
 
     def ink(self, paper=None):
         paper = self.paper_region() if paper is None else paper
@@ -359,8 +445,10 @@ def extract_line(mosaic):
     k = max(3, int(round(C.LINE_GAP_MM / res)) | 1)            # bridge small gaps in the pen line
     ink = cv2.morphologyEx(ink_full[y0:y1, x0:x1], cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
     seen = mosaic.seen_mask()[y0:y1, x0:x1]
-    # "near the edge of what was seen": 3 mm, plus the strip the paper mask trims off
-    m = int(round((3.0 + C.PAPER_EDGE_ERODE_MM) / res))
+    # "near the edge of what was seen": the strip the paper mask trims off
+    # (ink of a line that continues stops there) + 1 mm for blur. A larger
+    # margin wrongly calls a line "cut" whose end is just inside the picture.
+    m = int(round(C.CUT_MARGIN_MM / res)) + 1             # ink this close to the edge of the view = cut
     near_unseen = cv2.dilate((~seen).astype(np.uint8), np.ones((2 * m + 1, 2 * m + 1), np.uint8)) > 0
 
     dist = cv2.distanceTransform(ink, cv2.DIST_L2, 5) * res      # mm from each ink pixel to white
@@ -415,9 +503,24 @@ def extract_line(mosaic):
         ink_win = ink[max(0, rc[0] - rr):rc[0] + rr + 1, max(0, rc[1] - rr):rc[1] + rr + 1] > 0
         return bool(np.any(win & ink_win))
 
-    dot_cut = cut_near(dot_rc, dot_r + 1.0)
-    far_cut = cut_near(far_end, half_width + 2.0)
+    # windows big enough for a line cut off at a slant (its skeleton stops well
+    # before the end of the ink); the MARGIN to the view edge stays small
+    dot_cut = cut_near(dot_rc, max(dot_r + 1.0, 2.0 * half_width + 2.0))
+    far_cut = cut_near(far_end, 2.0 * half_width + 2.0)
     to_world = lambda rc: mosaic.to_world([(rc[0] + y0, rc[1] + x0)])[0]       # noqa: E731
+
+    # The seen line in world mm (thick end first) and, for every end that is cut
+    # off at the edge of the view, where it leaves and in which direction: used
+    # to plan a camera view that shows the WHOLE line.
+    chain_xy = mosaic.to_world([(r + y0, c + x0) for r, c in chain])
+    k_back = min(len(chain_xy) - 1, int(round(10.0 / res)))
+    cut_ends = []
+    for is_cut, end_xy, back_xy in ((dot_cut, chain_xy[0], chain_xy[k_back]),
+                                    (far_cut, chain_xy[-1], chain_xy[-1 - k_back])):
+        if is_cut:
+            d = end_xy - back_xy
+            cut_ends.append((end_xy, d / max(np.linalg.norm(d), 1e-6)))
+    seen = dict(points_xy=chain_xy[::4], cut_ends=cut_ends)
 
     if ratio < C.DOT_LINE_RATIO or dot_r < C.DOT_MIN_RADIUS_MM:
         if not (dot_cut or far_cut):                  # whole line visible, no dot: a drawing problem
@@ -435,7 +538,7 @@ def extract_line(mosaic):
                     end_at_unseen=True, end_xy=cut_xy, complete=False,
                     why=(f"the line runs out of the camera view near ({cut_xy[0]:.0f}, {cut_xy[1]:.0f}) mm "
                          "and the start dot is not visible yet"),
-                    open_xy=cut_xy, open_is_dot=False)
+                    open_xy=cut_xy, open_is_dot=False, **seen)
 
     dot_xy = to_world(dot_rc)
     xy = np.vstack([dot_xy, mosaic.to_world([(r + y0, c + x0) for r, c in chain])])
@@ -451,4 +554,118 @@ def extract_line(mosaic):
                 length_mm=length_px * res, half_width_mm=half_width,
                 end_at_unseen=far_cut, end_xy=far_xy,
                 complete=not (dot_cut or far_cut), why=why,
-                open_xy=dot_xy if dot_cut else (far_xy if far_cut else None), open_is_dot=dot_cut)
+                open_xy=dot_xy if dot_cut else (far_xy if far_cut else None), open_is_dot=dot_cut, **seen)
+
+
+# ---------------------------------------------------------------------------
+# Combining views: line up every view on the line itself
+# ---------------------------------------------------------------------------
+def _bilinear(img, rows, cols, outside):
+    ok = (rows >= 0) & (cols >= 0) & (rows < img.shape[0] - 1) & (cols < img.shape[1] - 1)
+    r = np.clip(rows, 0, img.shape[0] - 1.001)
+    c = np.clip(cols, 0, img.shape[1] - 1.001)
+    r0, c0 = r.astype(int), c.astype(int)
+    a, b = r - r0, c - c0
+    v = (img[r0, c0] * (1 - a) * (1 - b) + img[r0 + 1, c0] * a * (1 - b)
+         + img[r0, c0 + 1] * (1 - a) * b + img[r0 + 1, c0 + 1] * a * b)
+    return np.where(ok, v, outside)
+
+
+def view_line_points(cam, frame, T0c, z_plane):
+    """World xy (mm) of the skeleton of the ink seen in ONE view, and its ink area."""
+    single = Mosaic(cam)
+    single.reset(z_plane)
+    single.add_view(frame, T0c)
+    ink = single.ink()
+    if not np.any(ink):
+        return np.zeros((0, 2)), 0
+    return single.to_world(np.argwhere(thin(ink) > 0)[::2]), int(np.count_nonzero(ink))
+
+
+def align_view(target, pts, max_shift_mm=25.0, max_rot_deg=8.0, cutoff_mm=6.0):
+    """Rigid 2-D move (R, t) that puts the line seen in one view (its skeleton
+    points pts, from view_line_points) onto the line already in the map
+    `target`, or None if they do not overlap enough.
+
+    The skeleton points of the view's ink are matched against the distance
+    map of the target's ink (chamfer matching, Gauss-Newton on rotation +
+    shift). Only points inside the part the target has already seen count, and
+    points more than cutoff_mm from any ink (no overlap, other marks) do not
+    pull. Returns ((R, t), median distance before, after) or (None, ...)."""
+    ink_t = target.ink()
+    if len(pts) == 0 or not np.any(ink_t):
+        return None, np.nan, np.nan
+    seen_t = cv2.erode(target.seen_mask().astype(np.uint8), np.ones((11, 11), np.uint8)) > 0
+    g = np.round(target.to_grid(pts)).astype(int)
+    inb = (g[:, 0] >= 0) & (g[:, 1] >= 0) & (g[:, 0] < target.shape[0]) & (g[:, 1] < target.shape[1])
+    pts, g = pts[inb], g[inb]
+    A = pts[seen_t[g[:, 0], g[:, 1]]]
+    if len(A) < 40:
+        return None, np.nan, np.nan
+    dist = cv2.distanceTransform(np.where(ink_t > 0, 0, 255).astype(np.uint8), cv2.DIST_L2, 5) * target.res
+    c = A.mean(axis=0)
+
+    def moved(p):
+        th, tx, ty = p
+        R = np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]])
+        return (A - c) @ R.T + c + (tx, ty)
+
+    def resid(p):
+        g2 = target.to_grid(moved(p))
+        return np.minimum(_bilinear(dist, g2[:, 0], g2[:, 1], cutoff_mm), cutoff_mm)
+
+    p = np.zeros(3)
+    r = resid(p)
+    before = float(np.median(r))
+    lam = 1e-3
+    steps = np.array([math.radians(0.1), 0.1, 0.1])
+    for _ in range(40):
+        J = np.column_stack([(resid(p + np.eye(3)[i] * steps[i]) - r) / steps[i] for i in range(3)])
+        A_ = J.T @ J
+        g_ = J.T @ r
+        improved = False
+        for _ in range(8):
+            dp = np.linalg.solve(A_ + lam * np.diag(np.diag(A_) + 1e-9), -g_)
+            rn = resid(p + dp)
+            if rn @ rn < r @ r:
+                p, r, lam, improved = p + dp, rn, lam * 0.3, True
+                break
+            lam *= 10.0
+        if not improved or np.max(np.abs(dp)) < 1e-4:
+            break
+    after = float(np.median(r))
+    th, tx, ty = p
+    if abs(math.degrees(th)) > max_rot_deg or math.hypot(tx, ty) > max_shift_mm or after > 0.6 * cutoff_mm:
+        return None, before, after
+    R = np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]])
+    return (R, c - R @ c + (tx, ty)), before, after
+
+
+def combine_aligned(cam, views, z_plane=None, log=print):
+    """One map from several views (list of (frame, T0c)), each view lined up
+    on the line of the views added before it (align_view). The view with the
+    most ink is the reference; the others follow, best overlap first."""
+    z_plane = C.PAPER_Z if z_plane is None else z_plane
+    lines = [view_line_points(cam, frame, T0c, z_plane) for frame, T0c in views]
+    order = [int(i) for i in np.argsort([area for _, area in lines])[::-1]]
+    out = Mosaic(cam)
+    out.reset(z_plane)
+    first = order.pop(0)
+    out.add_view(*views[first])
+    while order:
+        best = None
+        for i in order:                                  # the view that overlaps the map best goes next
+            al, before, after = align_view(out, lines[i][0])
+            if al is not None and (best is None or after < best[3]):
+                best = (i, al, before, after)
+        if best is None:
+            for i in order:
+                log(f"  view {i + 1}: does not overlap the line of the other views - left out")
+            break
+        i, al, before, after = best
+        R, t = al
+        log(f"  view {i + 1}: moved by ({t[0]:.1f}, {t[1]:.1f}) mm, {math.degrees(math.atan2(R[1, 0], R[0, 0])):.1f} deg "
+            f"to line up with the others (mismatch {before:.1f} -> {after:.1f} mm)")
+        out.add_view(*views[i], align=al)
+        order.remove(i)
+    return out

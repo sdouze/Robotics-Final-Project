@@ -321,7 +321,7 @@ class Robot:
         move_joints), not here: a move that starts slightly outside the
         limits must still be allowed to bring the arm back inside."""
         units = np.degrees(np.abs(qdot)) * C.SPEED_HEADROOM / C.SPEED_UNIT_DEG_S
-        units = np.clip(np.round(units), 1, 1023)
+        units = np.clip(np.round(units), max(1, round(C.MIN_SERVO_SPEED_DEG_S / C.SPEED_UNIT_DEG_S)), 1023)
         self.arm.write_goal_speed(self.q_to_ticks(q), units)
         self.q_cmd = np.array(q, float)
 
@@ -344,6 +344,11 @@ class Robot:
             if self.realtime:
                 t_next += dt
                 time.sleep(max(0.0, t_next - time.perf_counter()))
+        # last set-point once more, at a brisk speed: the final samples of a
+        # smooth move are tiny, and a lagging joint would otherwise crawl to its
+        # goal at ~1 deg/s and jitter under the load of the arm and stylus
+        if len(q_samples):
+            self.command(self.q_cmd, np.full(len(self.q_cmd), np.radians(C.SETTLE_SPEED_DEG_S)) / C.SPEED_HEADROOM)
 
     def wait_settled(self, tol_deg=C.SETTLE_TOL_DEG, timeout=C.SETTLE_TIMEOUT_S, check_moving=True):
         """Wait until every servo reports 'not moving' and is within tol_deg.
@@ -433,6 +438,8 @@ class Robot:
         T = max(C.MIN_MOVE_TIME_S, 1.875 * L / speed)
         n = max(1, int(math.ceil(T * C.CONTROL_HZ)))
         qs = [kin.ik_tool(p_from + s * (p_to - p_from), pitch) for s in self.min_jerk(n)]
+        if self.q_cmd is not None and np.degrees(np.abs(qs[0] - self.q_cmd).max()) > 0.5 * C.MAX_JOINT_STEP_DEG:
+            self.move_joints(qs[0])                     # start pose differs (e.g. stylus angle): get there smoothly
         self.stream(qs)
         self.wait_settled(check_moving=not on_paper)
 

@@ -3,7 +3,9 @@
     python calibrate_robot.py               (add --camera 1 if needed)
 
 What it does (about 3 minutes):
-  1. Moves the arm SLOWLY to straight up (all servos at their centre).
+  1. Moves the arm SLOWLY to straight up (all servos at their centre); a joint
+     that hits a mechanical stop just stays there. The wrist (joint 4) is then
+     moved slowly to both ends to find its real range (-> JOINT_LIMITS_DEG).
      If a link is not straight you correct it with small jogs, e.g. "3 +5".
   2. Moves each joint a little and asks one letter: which way did it move?
      -> JOINT_DIRECTION (sign of every joint) and JOINT_OFFSET_DEG.
@@ -27,7 +29,7 @@ import numpy as np
 
 import config as C
 import kinematics as kin
-from robot import DxlArm, JointBlocked, Robot, ServoError
+from robot import ADDR_TORQUE_LIMIT, DxlArm, JointBlocked, Robot, ServoError
 
 SPEED = 15.0                        # deg/s - slow on purpose
 TESTS = (                           # joint, test move [deg], question, answer expected if sign is right
@@ -74,6 +76,54 @@ def move(robot, q_deg, label=""):
     robot.move_joints(np.radians(q_deg), speed_deg_s=SPEED)
 
 
+def move_safe(robot, q_deg, label="", quiet=False):
+    """Like move(), but a joint that gets blocked (mechanical stop) does not end
+    the calibration: the arm holds where it is and the reached pose is returned."""
+    try:
+        move(robot, q_deg, label)
+        return np.array(q_deg, float)
+    except JointBlocked:
+        q = np.degrees(robot.read_q())
+        robot.command(np.radians(q), np.zeros(4))       # hold exactly here, stop pushing
+        j = int(np.argmax(np.abs(q - np.asarray(q_deg, float))))
+        if not quiet:
+            print(f"  joint {j + 1} cannot go there - it stops at {q[j]:.1f} deg (servo scale) and stays there.")
+        return q
+
+
+def find_range(robot, pose, j, limit=145.0):
+    """Move joint j slowly to both sides until it is blocked (reduced force).
+    Returns (lowest, highest) reachable servo angle of that joint."""
+    arm = robot.arm
+    if hasattr(arm, "write2"):                           # real servo: half force while probing
+        arm.write2(arm.ids[j], ADDR_TORQUE_LIMIT, 512)
+    ends = []
+    try:
+        for side in (-1, +1):
+            print(f"  joint {j + 1} slowly towards the {'negative' if side < 0 else 'positive'} end ...")
+            cur = np.array(pose, float)
+            reached = cur[j]
+            while abs(cur[j] + side * 5.0) <= limit:        # 5 deg steps, check after each one
+                nxt = cur.copy()
+                nxt[j] += side * 5.0
+                robot.move_joints(np.radians(nxt), speed_deg_s=SPEED, settle=False)
+                if robot.realtime:
+                    time.sleep(0.4)
+                q = np.degrees(robot.read_q())
+                reached = q[j]
+                if abs(q[j] - nxt[j]) > 3.0:                # did not follow: mechanical stop
+                    robot.command(np.radians(q), np.zeros(4))   # stop pushing at once
+                    break
+                cur = nxt
+            ends.append(float(reached))
+            print(f"    stops at {reached:.1f} deg (servo scale)")
+            move_safe(robot, pose, quiet=True)
+    finally:
+        if hasattr(arm, "write2"):
+            arm.write2(arm.ids[j], ADDR_TORQUE_LIMIT, C.TORQUE_LIMIT)
+    return min(ends), max(ends)
+
+
 def write_config(values):
     """Replace the assignment lines in config.py; keep a timestamped backup."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.py")
@@ -81,7 +131,9 @@ def write_config(values):
     shutil.copyfile(path, backup)
     text = open(path, encoding="utf-8").read()
     for name, val in values.items():
-        new, n = re.subn(rf"^{name} = \([^)]*\)", f"{name} = {val}", text, flags=re.M)
+        pattern = (rf"^{name} = \(\(.*?\)\)" if val.startswith("((")       # tuple of tuples
+                   else rf"^{name} = \([^)]*\)")
+        new, n = re.subn(pattern, lambda _m: f"{name} = {val}", text, flags=re.M | re.S)
         if n != 1:
             raise RuntimeError(f"could not find '{name} = (...)' in config.py")
         text = new
@@ -202,42 +254,90 @@ def calibrate(robot, camera):
     print(f"\nSTEP 1 - straight up.  Servo angles now (from centre): {np.round(q, 1)} deg")
     input("  The arm will move SLOWLY to straight up (joint 2 first, so it lifts off the table).\n"
           "  Press Enter to start...")
-    move(robot, [q[0], 0.0, q[2], q[3]], "shoulder (joint 2) up")
-    move(robot, [q[0], 0.0, 0.0, 0.0], "elbow and wrist (joints 3, 4) straight")
-    move(robot, [0.0, 0.0, 0.0, 0.0], "base (joint 1) to centre")
+    pose = q.copy()
+    pose[1] = 0.0
+    pose = move_safe(robot, pose, "shoulder (joint 2) up")
+    pose[2], pose[3] = 0.0, 0.0
+    pose = move_safe(robot, pose, "elbow and wrist (joints 3, 4) straight")
+    pose[0] = 0.0
+    pose = move_safe(robot, pose, "base (joint 1) to centre")
 
-    jog = np.zeros(4)
-    print("\n  Now compare with Figure 1: all links in ONE vertical line, stylus pointing up,\n"
+    # the wrist (joint 4) has mechanical stops on some robots: find its real range
+    print("\nSTEP 1b - wrist range. The wrist (joint 4) moves SLOWLY and with reduced force to\n"
+          "  both ends; where it stops is its real range.")
+    input("  Press Enter to start (nothing should be in the way of the camera/stylus)...")
+    wrist = find_range(robot, pose, 3)
+    pose[3] = float(np.clip(0.0, wrist[0] + 3.0, wrist[1] - 3.0))
+    pose = move_safe(robot, pose, "wrist as straight as it can")
+
+    jog = pose.copy()
+    extra = np.zeros(4)
+    print("\n  Now compare with Figure 1: all links in ONE vertical line,\n"
           "  and the arm should bend towards the FRONT (paper side), i.e. the servo shafts of\n"
           "  joints 2-4 point to the left/right.\n"
           "  If something is off, jog it: type '<joint> <degrees>', e.g. '3 +5' or '1 -90'.\n"
+          "  If a joint CANNOT move further but is still not straight, type how many degrees\n"
+          "  it is still away, with 'set', e.g. 'set 4 +15' (it would need +15 deg more).\n"
           "  Press Enter (empty line) when it is straight.")
     while True:
-        cmd = input("  jog> ").strip()
+        cmd = input("  jog> ").strip().lower()
         if not cmd:
             break
-        m = re.fullmatch(r"([1-4])\s*([+-]?\d+(\.\d+)?)", cmd)
+        cmd = cmd.replace("°", "").replace("deg", "").replace(",", ".")
+        m = re.fullmatch(r"(set\s*)?([1-4])\s*([+-]?)\s*(\d+(?:\.\d+)?)", cmd)
         if not m:
-            print("  format: joint and degrees, e.g. '3 +5'")
+            print("  format: '3 +5' or '4 -20' (move joint 4 by -20 deg), "
+                  "or 'set 4 +15' (cannot move, still 15 deg away from straight)")
             continue
-        jog[int(m.group(1)) - 1] += float(m.group(2))
-        move(robot, jog)
-    straight_ticks = robot.q_to_ticks(np.radians(jog))
-    print(f"  straight pose = servo ticks {straight_ticks.tolist()}")
+        j = int(m.group(2)) - 1
+        deg = float(m.group(4)) * (-1.0 if m.group(3) == "-" else 1.0)
+        if m.group(1):
+            extra[j] += deg
+            print(f"  noted: joint {j + 1} is straight at {jog[j] + extra[j]:.1f} deg (servo scale)")
+            continue
+        target = jog.copy()
+        target[j] += deg
+        if abs(target[j]) > 145.0:
+            print(f"  joint {j + 1} would be at {target[j]:.0f} deg - outside the servo range (+-145 deg). "
+                  "Use a smaller step.")
+            continue
+        try:
+            jog = move_safe(robot, target)
+        except kin.IKError as e:
+            print(f"  cannot move there: {e}")
+            continue
+        print(f"  joint angles now (servo scale): {np.round(jog, 1)} deg")
+    straight_deg = jog + extra
+    straight_ticks = robot.q_to_ticks(np.radians(straight_deg))
+    print(f"  straight pose = servo angles {np.round(straight_deg, 1)} deg (ticks {straight_ticks.tolist()})")
 
     print("\nSTEP 2 - directions. Each joint moves a little and comes back.")
     direction = np.ones(4, int)
     for j, delta, question, options, expected in TESTS:
+        if j == 3 and not (wrist[0] + 2 <= jog[j] + delta <= wrist[1] - 2):
+            delta = -delta                                       # no room on that side of the wrist
+            expected = options[1] if expected == options[0] else options[0]
         test = jog.copy()
         test[j] += delta
-        move(robot, test, f"joint {j + 1} by {delta:+.0f} deg")
+        reached = move_safe(robot, test, f"joint {j + 1} by {delta:+.0f} deg")
+        if abs(reached[j] - jog[j]) < 0.5 * abs(delta):         # blocked: try the other way
+            delta, expected = -delta, (options[1] if expected == options[0] else options[0])
+            test = jog.copy()
+            test[j] += delta
+            move_safe(robot, jog)
+            move_safe(robot, test, f"joint {j + 1} by {delta:+.0f} deg instead")
         answer = ask(question, options)
         direction[j] = 1 if answer == expected else -1
         print(f"  -> joint {j + 1}: {'OK, same direction as the model' if direction[j] == 1 else 'REVERSED'}")
-        move(robot, jog)
+        move_safe(robot, jog)
 
     # offset: the straight pose must become q = 0 with the new directions
     offset = np.round(direction * (straight_ticks - C.TICKS_CENTER) * C.DEG_PER_TICK, 2)
+    # wrist range in calibrated angles (q = d * servo angle - offset), 3 deg margin
+    lim = sorted(direction[3] * np.array(wrist) - offset[3])
+    wrist_limits = (round(lim[0] + 3.0, 1), round(lim[1] - 3.0, 1))
+    print(f"  wrist (joint 4) can move {wrist_limits[0]:.1f} .. {wrist_limits[1]:.1f} deg "
+          "from straight (with margin)")
 
     print("\nSTEP 3 - camera (the arm stays straight up).")
     print("  Which way does the camera LENS look right now?\n"
@@ -260,9 +360,11 @@ def calibrate(robot, camera):
         x_c = world if side == "r" else -world
         y_c = np.cross(z_c, x_c)
 
+    limits = [tuple(map(float, row)) for row in C.JOINT_LIMITS_DEG[:3]] + [wrist_limits]
     values = {
         "JOINT_DIRECTION": fmt(direction),
         "JOINT_OFFSET_DEG": fmt(offset),
+        "JOINT_LIMITS_DEG": "(" + ",\n                    ".join(fmt(r) for r in limits) + ")",
         "CAMERA_OPTICAL_AXIS_IN_F5": fmt(z_c),
         "CAMERA_IMAGE_RIGHT_IN_F5": fmt(x_c),
         "CAMERA_IMAGE_DOWN_IN_F5": fmt(y_c),

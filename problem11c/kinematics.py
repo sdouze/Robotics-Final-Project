@@ -76,8 +76,20 @@ def _camera_rotation_in_f5():
     return np.column_stack((x_c, y_c, z_c))
 
 
+def rotvec_matrix(r):
+    """Rotation matrix of a rotation vector r (radians, axis * angle)."""
+    r = np.asarray(r, float)
+    th = float(np.linalg.norm(r))
+    if th < 1e-12:
+        return np.eye(3)
+    k = np.array([[0, -r[2], r[1]], [r[2], 0, -r[0]], [-r[1], r[0], 0]]) / th
+    return np.eye(3) + math.sin(th) * k + (1 - math.cos(th)) * k @ k
+
+
 T5C = np.eye(4)
-T5C[:3, :3] = _camera_rotation_in_f5()
+# nominal axes, then the small mounting correction measured with the stylus
+# (line_follower.py --check-camera, keys t / g / f), about the camera's own axes
+T5C[:3, :3] = _camera_rotation_in_f5() @ rotvec_matrix(np.radians(getattr(C, "CAMERA_FIX_DEG", (0, 0, 0))))
 
 # Angle of the optical axis relative to the stylus, measured in the arm plane
 # (positive = towards y4). 0 if the lens looks along the stylus, +-90 deg if it
@@ -133,8 +145,12 @@ def _wrap(a):
 
 
 def check_limits(q):
+    """IKError if a joint is outside JOINT_LIMITS_DEG. LIMIT_TOLERANCE_DEG of
+    slack: the software limits already keep a safety margin to the mechanical
+    stops, and a pose computed right at a limit must not fail on rounding."""
     q = np.asarray(q, float)
-    bad = (q < JOINT_LIMITS[:, 0] - 1e-9) | (q > JOINT_LIMITS[:, 1] + 1e-9)
+    tol = math.radians(getattr(C, "LIMIT_TOLERANCE_DEG", 0.0)) + 1e-9
+    bad = (q < JOINT_LIMITS[:, 0] - tol) | (q > JOINT_LIMITS[:, 1] + tol)
     if np.any(bad):
         j = int(np.argmax(bad))
         raise IKError(f"joint {j + 1} = {math.degrees(q[j]):.1f} deg is outside "
@@ -224,6 +240,15 @@ class CameraModel:
         self.K = np.asarray(K, float)
         self.width = width
         self.height = height
+        self.valid = None
+
+    def set_undistortion(self, dist):
+        """Pixels that hold image content after cv2.undistort (the rest is black
+        border); used by the map so those borders count as 'not seen'."""
+        import cv2
+        full = np.full((self.height, self.width), 255, np.uint8)
+        und = cv2.undistort(full, self.K, np.asarray(dist, float))
+        self.valid = cv2.erode((und > 250).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
 
     @classmethod
     def from_fov(cls, width, height, hfov_deg):
